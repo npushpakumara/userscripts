@@ -29,12 +29,6 @@
 (function ($) {
   "use strict";
 
-  document.addEventListener("keydown", (e) => {
-    console.log(
-      `[KeyDown] key=${e.key} | altKey=${e.altKey} | shift=${e.shiftKey} | metaKey=${e.metaKey}`
-    );
-  });
-
   const ROW_SELECTOR = "thead tr, tbody tr, tfoot tr, .row";
   const CELL_SELECTOR = "td, th, .row";
 
@@ -147,7 +141,6 @@
       )
       .join("\n");
     GM_setClipboard(tsv);
-    console.log("[GridCopier] copied\n" + tsv);
   };
 
   const isAddMode = (e) => e.altKey && e.shiftKey;
@@ -195,7 +188,6 @@
 
       if (isClickOnly && txt) {
         GM_setClipboard(txt);
-        console.log("[GridCopier] copied single cell:", txt);
       } else {
         copySel();
       }
