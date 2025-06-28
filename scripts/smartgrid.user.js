@@ -9,8 +9,8 @@
 // @grant        GM_setClipboard
 // @license      MIT
 // @homepage     https://github.com/npushpakumara/userscripts
-// @downloadURL  https://raw.githubusercontent.com/npushpakumara/repo/main/smartgrid.user.js
-// @updateURL    https://npushpakumara.github.io/npushpakumara/scripts/smartgrid.user.js
+// @downloadURL  https://raw.githubusercontent.com/npushpakumara/userscripts/main/smartgrid.user.js
+// @updateURL    https://raw.githubusercontent.com/npushpakumara/userscripts/main/smartgrid.user.js
 //
 // ───── CHANGE LOG ──────────────────────────────────────────────────────────
 // 1.0.1  2025-06-28  - Shift-based multi-selection: Ctrl/Meta replaced with Shift
