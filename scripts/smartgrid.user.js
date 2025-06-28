@@ -11,7 +11,8 @@
 // @homepage     https://github.com/npushpakumara/userscripts
 // @downloadURL  https://raw.githubusercontent.com/npushpakumara/userscripts/main/scripts/smartgrid.user.js
 // @updateURL    https://raw.githubusercontent.com/npushpakumara/userscripts/main/scripts/smartgrid.user.js
-//
+// ==/UserScript==
+
 // ───── CHANGE LOG ──────────────────────────────────────────────────────────
 // 1.0.1  2025-06-28  - Shift-based multi-selection: Ctrl/Meta replaced with Shift
 //                    - Selection copy improved: entire selection copied, not just last drag
@@ -23,8 +24,6 @@
 //
 // >>  Add a new dated bullet every time you increment @version.  <<
 // >>  Keep older entries or truncate to last N versions—your call. <<
-//
-// ==/UserScript==
 
 (function ($) {
   "use strict";
