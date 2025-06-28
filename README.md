@@ -1,4 +1,4 @@
-# 🧠 Userscripts Collection by [Your Name]
+# 🧠 Userscripts Collection by Nalin Pushpakumara
 
 A curated set of productivity-enhancing user scripts for browser automation via Tampermonkey.
 
