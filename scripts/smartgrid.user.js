@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SmartGrid Select & Copy
 // @author       Nalin Pushpakumara
-// @version      1.0.1
+// @version      1.0.2
 // @description  Alt-drag to select table cells, Shift to extend selections, Alt-click to copy a single cell. Automatically copies selections to clipboard. Works with table-like grids and responsive column layouts.
 // @match        *://*/*
 // @run-at       document-idle
