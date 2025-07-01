@@ -14,6 +14,10 @@
 // ==/UserScript==
 
 // ───── CHANGE LOG ──────────────────────────────────────────────────────────
+// 1.0.2  2025-07-01  - Cross-platform activation support: Cmd (Mac) and Alt (Windows/Linux)
+//                    - Cursor now changes as soon as activation key is pressed (Cmd or Alt)
+//                    - Improved Bootstrap table compatibility: better row/column indexing
+//                    - Selection now works reliably with <thead>, <tbody>, and .table-responsive wrappers
 // 1.0.1  2025-06-28  - Shift-based multi-selection: Ctrl/Meta replaced with Shift
 //                    - Selection copy improved: entire selection copied, not just last drag
 //                    - Alt + Shift + Drag now extends selections
@@ -28,17 +32,24 @@
 (function ($) {
   "use strict";
 
+  const USE_ALT = true;
+  const USE_META = true;
+
+  const MODIFIER_KEY = {
+    primary: (e) => (USE_ALT && e.altKey) || (USE_META && e.metaKey),
+    shift: (e) => e.shiftKey,
+  };
+
   const ROW_SELECTOR = "thead tr, tbody tr, tfoot tr, .row";
   const CELL_SELECTOR = "td, th, .row";
-
   const css = `
     ${CELL_SELECTOR}{
       user-select:text!important;
     }
-    .tm-sel{
+    .smart__sel{
       background:#b3d4ff!important;
     }
-    #tm-box{
+    #smart__box{
       position:absolute;
       pointer-events:none;
       z-index:2147483647;
@@ -46,13 +57,13 @@
       border-radius:2px;
       display:none;
     }
-    body.tm-selecting,body.tm-selecting * {
+    body.smart__selecting,body.smart__selecting * {
       cursor: crosshair!important;
       }`;
   $("<style>").text(css).appendTo("head");
 
   const unlock = ($root) =>
-    $root.find(CELL_SELECTOR).each(function () {
+    $root.find("td, th").each(function () {
       this.onselectstart = this.onmousedown = null;
     });
   unlock($(document));
@@ -60,13 +71,28 @@
     m.forEach((r) => $(r.addedNodes).each((_, n) => unlock($(n))))
   ).observe(document.body, { childList: true, subtree: true });
 
-  const rIdx = ($c) =>
-    ROW_SELECTOR ? $c.closest(ROW_SELECTOR).index(ROW_SELECTOR) : $c.index();
-  const cIdx = ($c) => (ROW_SELECTOR ? $c.index() : 0);
+  const rIdx = ($c) => {
+    const $row = $c.closest("tr");
+    const $table = $row.closest("table");
+    return $table.find("tr").index($row);
+  };
+
+  const cIdx = ($c) => {
+    const $cell = $c.closest("td, th");
+    const $row = $cell.closest("tr");
+    return $row.find("td, th").index($cell);
+  };
+
+  const getCell = (r, c) => {
+    const $rows = $scope.find("tr");
+    const $row = $rows.eq(r);
+    return $row.find("td, th").eq(c);
+  };
+
   const key = (r, c) => `${r}|${c}`;
 
   const sel = new Set();
-  const $box = $('<div id="tm-box">').appendTo("body");
+  const $box = $('<div id="smart__box">').appendTo("body");
   let dragging = false,
     $scope = $(document);
   let startR = 0,
@@ -75,14 +101,11 @@
     curC = 0;
 
   const paint = () => {
-    $(CELL_SELECTOR, $scope).removeClass("tm-sel");
+    $(CELL_SELECTOR, $scope).removeClass("smart__sel");
     sel.forEach((k) => {
       const [r, c] = k.split("|").map(Number);
-      const $row = ROW_SELECTOR ? $scope.find(ROW_SELECTOR).eq(r) : $scope;
-      const $cel = ROW_SELECTOR
-        ? $row.children(CELL_SELECTOR).eq(c)
-        : $row.children(CELL_SELECTOR).eq(r);
-      $cel.addClass("tm-sel");
+      const $cel = getCell(r, c);
+      $cel.addClass("smart__sel");
     });
   };
 
@@ -142,14 +165,14 @@
     GM_setClipboard(tsv);
   };
 
-  const isAddMode = (e) => e.altKey && e.shiftKey;
+  const isAddMode = (e) => MODIFIER_KEY.primary(e) && MODIFIER_KEY.shift(e);
 
   $(document)
     .on("mousedown", CELL_SELECTOR, function (e) {
-      const wantsSelect = e.altKey;
+      const wantsSelect = MODIFIER_KEY.primary(e);
       if (e.button !== 0 || !wantsSelect) return;
-      $("body").addClass("tm-selecting");
-      $scope = $(this).closest("table, .container, .row-group");
+      if (!isModifierHeld) $("body").addClass("smart__selecting");
+      $scope = $(this).closest("table");
       startR = curR = rIdx($(this));
       startC = curC = cIdx($(this));
       if (!isAddMode(e)) sel.clear();
@@ -177,7 +200,7 @@
     .on("mouseup", function (e) {
       if (!dragging) return;
       dragging = false;
-      $("body").removeClass("tm-selecting");
+      $("body").removeClass("smart__selecting");
       $box.hide();
 
       paint();
@@ -202,4 +225,22 @@
     },
     true
   );
+
+  let isModifierHeld = false;
+
+  window.addEventListener("keydown", (e) => {
+    if (MODIFIER_KEY.primary(e)) {
+      isModifierHeld = true;
+      document.body.classList.add("smart__selecting");
+    }
+  });
+
+  window.addEventListener("keyup", (e) => {
+    if (!MODIFIER_KEY.primary(e)) {
+      isModifierHeld = false;
+      if (!dragging) {
+        document.body.classList.remove("smart__selecting");
+      }
+    }
+  });
 })(window.jQuery.noConflict(true));
