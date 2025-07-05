@@ -14,6 +14,9 @@
 // ==/UserScript==
 
 // ───── CHANGE LOG ──────────────────────────────────────────────────────────
+// 1.0.3  2025-07-05  - Fixed compatibility with complex tables (multi-row <thead>, <tfoot>)
+//                    - Now works with Bootstrap tables having multiple header/filter rows
+//                    - Selection & copy now skip header rows by default (configurable)
 // 1.0.2  2025-07-01  - Cross-platform activation support: Cmd (Mac) and Alt (Windows/Linux)
 //                    - Cursor now changes as soon as activation key is pressed (Cmd or Alt)
 //                    - Improved Bootstrap table compatibility: better row/column indexing
@@ -40,8 +43,9 @@
     shift: (e) => e.shiftKey,
   };
 
-  const ROW_SELECTOR = "thead tr, tbody tr, tfoot tr, .row";
-  const CELL_SELECTOR = "td, th, .row";
+  const EXCLUDE_HEADER_ROWS_IN_COPY = false;
+
+  const CELL_SELECTOR = "td, th";
   const css = `
     ${CELL_SELECTOR}{
       user-select:text!important;
@@ -59,11 +63,11 @@
     }
     body.smart__selecting,body.smart__selecting * {
       cursor: crosshair!important;
-      }`;
+    }`;
   $("<style>").text(css).appendTo("head");
 
   const unlock = ($root) =>
-    $root.find("td, th").each(function () {
+    $root.find(CELL_SELECTOR).each(function () {
       this.onselectstart = this.onmousedown = null;
     });
   unlock($(document));
@@ -71,10 +75,13 @@
     m.forEach((r) => $(r.addedNodes).each((_, n) => unlock($(n))))
   ).observe(document.body, { childList: true, subtree: true });
 
+  const getRows = ($table) => $table.find("thead tr, tbody tr, tfoot tr");
+
   const rIdx = ($c) => {
     const $row = $c.closest("tr");
     const $table = $row.closest("table");
-    return $table.find("tr").index($row);
+    const rows = getRows($table);
+    return rows.index($row);
   };
 
   const cIdx = ($c) => {
@@ -84,8 +91,8 @@
   };
 
   const getCell = (r, c) => {
-    const $rows = $scope.find("tr");
-    const $row = $rows.eq(r);
+    const rows = getRows($scope);
+    const $row = rows.eq(r);
     return $row.find("td, th").eq(c);
   };
 
@@ -119,12 +126,8 @@
   };
 
   const updateBox = () => {
-    const $start = $(CELL_SELECTOR, $scope)
-      .filter((_, x) => rIdx($(x)) === startR && cIdx($(x)) === startC)
-      .first();
-    const $cur = $(CELL_SELECTOR, $scope)
-      .filter((_, x) => rIdx($(x)) === curR && cIdx($(x)) === curC)
-      .first();
+    const $start = getCell(startR, startC);
+    const $cur = getCell(curR, curC);
     if (!$start.length || !$cur.length) {
       $box.hide();
       return;
@@ -145,18 +148,20 @@
       (m[r] ??= []).push(+c);
       return m;
     }, {});
-    const tsv = Object.keys(rows)
-      .sort((a, b) => a - b)
+    const sortedRowIndices = Object.keys(rows)
+      .map(Number)
+      .sort((a, b) => a - b);
+    const tsv = sortedRowIndices
+      .filter((r) => {
+        if (!EXCLUDE_HEADER_ROWS_IN_COPY) return true;
+        const $row = getRows($scope).eq(r);
+        return !$row.closest("thead").length;
+      })
       .map((r) =>
         rows[r]
           .sort((a, b) => a - b)
           .map((c) => {
-            const $row = ROW_SELECTOR
-              ? $scope.find(ROW_SELECTOR).eq(r)
-              : $scope;
-            const $cel = ROW_SELECTOR
-              ? $row.children(CELL_SELECTOR).eq(c)
-              : $row.children(CELL_SELECTOR).eq(r);
+            const $cel = getCell(r, c);
             return $cel.text().trim();
           })
           .join("\t")
@@ -167,16 +172,16 @@
 
   const isAddMode = (e) => MODIFIER_KEY.primary(e) && MODIFIER_KEY.shift(e);
 
+  let isModifierHeld = false;
+
   $(document)
     .on("mousedown", CELL_SELECTOR, function (e) {
-      const wantsSelect = MODIFIER_KEY.primary(e);
-      if (e.button !== 0 || !wantsSelect) return;
+      if (e.button !== 0 || !MODIFIER_KEY.primary(e)) return;
       if (!isModifierHeld) $("body").addClass("smart__selecting");
       $scope = $(this).closest("table");
       startR = curR = rIdx($(this));
       startC = curC = cIdx($(this));
       if (!isAddMode(e)) sel.clear();
-      rectKeys().forEach((k) => sel.add(k));
       rectKeys().forEach((k) => sel.add(k));
       paint();
       $box.show();
@@ -215,20 +220,11 @@
       }
     });
 
-  window.addEventListener(
-    "keydown",
-    (e) => {
-      if (e.key === "Escape" || e.code === "Escape") {
-        sel.clear();
-        paint();
-      }
-    },
-    true
-  );
-
-  let isModifierHeld = false;
-
   window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" || e.code === "Escape") {
+      sel.clear();
+      paint();
+    }
     if (MODIFIER_KEY.primary(e)) {
       isModifierHeld = true;
       document.body.classList.add("smart__selecting");
