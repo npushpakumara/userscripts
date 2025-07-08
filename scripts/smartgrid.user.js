@@ -13,106 +13,138 @@
 // @updateURL    https://raw.githubusercontent.com/npushpakumara/userscripts/main/scripts/smartgrid.user.js
 // ==/UserScript==
 
-// ───── CHANGE LOG ──────────────────────────────────────────────────────────
-// 1.0.3  2025-07-05  - Fixed compatibility with complex tables (multi-row <thead>, <tfoot>)
-//                    - Now works with Bootstrap tables having multiple header/filter rows
-//                    - Selection & copy now skip header rows by default (configurable)
-// 1.0.2  2025-07-01  - Cross-platform activation support: Cmd (Mac) and Alt (Windows/Linux)
-//                    - Cursor now changes as soon as activation key is pressed (Cmd or Alt)
-//                    - Improved Bootstrap table compatibility: better row/column indexing
-//                    - Selection now works reliably with <thead>, <tbody>, and .table-responsive wrappers
-// 1.0.1  2025-06-28  - Shift-based multi-selection: Ctrl/Meta replaced with Shift
-//                    - Selection copy improved: entire selection copied, not just last drag
-//                    - Alt + Shift + Drag now extends selections
-//                    - Fixed bugs: last row & header selection now work properly
-// 1.0.0  2025-06-27  - First public release: generic ROW_SELECTOR / CELL_SELECTOR,
-//                    - Initial table implementation with single-block selection.
-// ───────────────────────────────────────────────────────────────────────────
-//
+/*──────────────────────── CHANGELOG ─────────────────────
+    1.0.4  2025-07-06  – Traditional-table fix: selection now
+                         triggers even when click starts on
+                         nested elements (<a>, <span>, <input>, …)
+    1.0.3  2025-07-05  - Fixed compatibility with complex tables (multi-row <thead>, <tfoot>)
+                       - Now works with Bootstrap tables having multiple header/filter rows
+                       - Selection & copy now skip header rows by default (configurable)
+    1.0.2  2025-07-01  - Cross-platform activation support: Cmd (Mac) and Alt (Windows/Linux)
+                       - Cursor now changes as soon as activation key is pressed (Cmd or Alt)
+                       - Improved Bootstrap table compatibility: better row/column indexing
+                       - Selection now works reliably with <thead>, <tbody>, and .table-responsive wrappers
+    1.0.1  2025-06-28  - Shift-based multi-selection: Ctrl/Meta replaced with Shift
+                       - Selection copy improved: entire selection copied, not just last drag
+                       - Alt + Shift + Drag now extends selections
+                       - Fixed bugs: last row & header selection now work properly
+    1.0.0  2025-06-27  - First public release: generic ROW_SELECTOR / CELL_SELECTOR,
+  ──────────────────────────────────────────────────────────*/
+
 // >>  Add a new dated bullet every time you increment @version.  <<
 // >>  Keep older entries or truncate to last N versions—your call. <<
 
 (function ($) {
   "use strict";
 
-  const USE_ALT = true;
-  const USE_META = true;
-
-  const MODIFIER_KEY = {
-    primary: (e) => (USE_ALT && e.altKey) || (USE_META && e.metaKey),
-    shift: (e) => e.shiftKey,
+  const CONFIG = {
+    keys: {
+      primary: { win: "Alt", mac: "Meta" },
+      extend: "Shift",
+      kbToggle: "k",
+    },
+    debounceMs: 250,
+    toastDuration: 2000,
+    css: {
+      selClass: "smart__sel",
+      bodyClass: "smart__selecting",
+      boxId: "smart__box",
+      toastId: "smart__toast",
+      highlight: "#b3d4ff",
+      outline: "#1a73e8",
+      toastBg: "rgba(60,60,60,.9)",
+      toastFg: "#fff",
+    },
   };
 
-  const EXCLUDE_HEADER_ROWS_IN_COPY = false;
+  const isPrimary = (e) =>
+    (CONFIG.keys.primary.win && e.altKey) ||
+    (CONFIG.keys.primary.mac && e.metaKey);
+  const isExtending = (e) => e.shiftKey;
 
-  const CELL_SELECTOR = "td, th";
-  const css = `
-    ${CELL_SELECTOR}{
-      user-select:text!important;
-    }
-    .smart__sel{
-      background:#b3d4ff!important;
-    }
-    #smart__box{
-      position:absolute;
-      pointer-events:none;
-      z-index:2147483647;
-      border:2px solid #1a73e8;
-      border-radius:2px;
-      display:none;
-    }
-    body.smart__selecting,body.smart__selecting * {
-      cursor: crosshair!important;
-    }`;
-  $("<style>").text(css).appendTo("head");
+  const ROW_SEL = "tr, .row.details, .row.container-fluid";
+  const CELL_SEL = "td, th, [class*='col-']";
 
-  const unlock = ($root) =>
-    $root.find(CELL_SELECTOR).each(function () {
+  const style = `
+    ${CELL_SEL}{user-select:text!important;}
+    .${CONFIG.css.selClass}{background:${CONFIG.css.highlight}!important;}
+    #${CONFIG.css.boxId}{
+      position:absolute;pointer-events:none;z-index:2147483647;
+      border:2px solid ${CONFIG.css.outline};border-radius:2px;display:none;}
+    body.${CONFIG.css.bodyClass},body.${CONFIG.css.bodyClass} *{cursor:crosshair!important;}
+    #${CONFIG.css.toastId}{
+      position:fixed;bottom:16px;right:16px;z-index:2147483648;
+      background:${CONFIG.css.toastBg};color:${CONFIG.css.toastFg};
+      padding:8px 12px;border-radius:6px;font:14px/1 sans-serif;
+      opacity:0;pointer-events:none;transition:opacity .25s;}
+  `;
+  $("<style>").text(style).appendTo("head");
+
+  const $toast = $(`<div id="${CONFIG.css.toastId}"/>`).appendTo("body");
+  let toastTimer;
+  function showToast(msg) {
+    clearTimeout(toastTimer);
+    $toast.text(msg).css("opacity", 1);
+    toastTimer = setTimeout(
+      () => $toast.css("opacity", 0),
+      CONFIG.toastDuration
+    );
+  }
+
+  const unlock = ($r) =>
+    $r.find(CELL_SEL).each(function () {
       this.onselectstart = this.onmousedown = null;
     });
+
+  const debounce = (fn, ms) => {
+    let t;
+    return (...a) => {
+      clearTimeout(t);
+      t = setTimeout(() => fn(...a), ms);
+    };
+  };
+  const unlockBatch = debounce(
+    (nodes) => nodes.forEach((n) => unlock($(n))),
+    CONFIG.debounceMs
+  );
+
   unlock($(document));
-  new MutationObserver((m) =>
-    m.forEach((r) => $(r.addedNodes).each((_, n) => unlock($(n))))
-  ).observe(document.body, { childList: true, subtree: true });
+  const mo = new MutationObserver((m) =>
+    unlockBatch(m.flatMap((r) => [...r.addedNodes]))
+  );
+  mo.observe(document.body, { childList: true, subtree: true });
 
-  const getRows = ($table) => $table.find("thead tr, tbody tr, tfoot tr");
+  document.addEventListener("visibilitychange", () => {
+    document.hidden
+      ? mo.disconnect()
+      : mo.observe(document.body, { childList: true, subtree: true });
+  });
 
-  const rIdx = ($c) => {
-    const $row = $c.closest("tr");
-    const $table = $row.closest("table");
-    const rows = getRows($table);
-    return rows.index($row);
-  };
-
-  const cIdx = ($c) => {
-    const $cell = $c.closest("td, th");
-    const $row = $cell.closest("tr");
-    return $row.find("td, th").index($cell);
-  };
-
-  const getCell = (r, c) => {
-    const rows = getRows($scope);
-    const $row = rows.eq(r);
-    return $row.find("td, th").eq(c);
-  };
-
+  const getRows = ($t) => $t.find(ROW_SEL);
+  const rowIdx = ($el, rows) => rows.index($el.closest(ROW_SEL));
+  const colIdx = ($el) =>
+    $el.closest(ROW_SEL).children(CELL_SEL).index($el.closest(CELL_SEL));
+  const getCell = ($scope, r, c) =>
+    $scope.find(ROW_SEL).eq(r).children(CELL_SEL).eq(c);
   const key = (r, c) => `${r}|${c}`;
 
+  let $scope = $(document);
   const sel = new Set();
-  const $box = $('<div id="smart__box">').appendTo("body");
+  const $box = $(`<div id="${CONFIG.css.boxId}"/>`).appendTo("body");
   let dragging = false,
-    $scope = $(document);
-  let startR = 0,
-    startC = 0,
-    curR = 0,
-    curC = 0;
+    startR,
+    startC,
+    curR,
+    curC,
+    scopeRows,
+    modifierHeld = false,
+    kbMode = false;
 
   const paint = () => {
-    $(CELL_SELECTOR, $scope).removeClass("smart__sel");
+    $scope.find(`.${CONFIG.css.selClass}`).removeClass(CONFIG.css.selClass);
     sel.forEach((k) => {
       const [r, c] = k.split("|").map(Number);
-      const $cel = getCell(r, c);
-      $cel.addClass("smart__sel");
+      getCell($scope, r, c).addClass(CONFIG.css.selClass);
     });
   };
 
@@ -126,117 +158,211 @@
   };
 
   const updateBox = () => {
-    const $start = getCell(startR, startC);
-    const $cur = getCell(curR, curC);
-    if (!$start.length || !$cur.length) {
+    const $a = getCell($scope, startR, startC);
+    const $b = getCell($scope, curR, curC);
+    if (!$a.length || !$b.length) {
       $box.hide();
       return;
     }
-    const r1 = $start[0].getBoundingClientRect();
-    const r2 = $cur[0].getBoundingClientRect();
-    const left = Math.min(r1.left, r2.left) + scrollX;
-    const top = Math.min(r1.top, r2.top) + scrollY;
-    const right = Math.max(r1.right, r2.right) + scrollX;
-    const bottom = Math.max(r1.bottom, r2.bottom) + scrollY;
-    $box.css({ left, top, width: right - left, height: bottom - top });
+    const ra = $a[0].getBoundingClientRect(),
+      rb = $b[0].getBoundingClientRect();
+    const left = Math.min(ra.left, rb.left) + scrollX;
+    const top = Math.min(ra.top, rb.top) + scrollY;
+    const right = Math.max(ra.right, rb.right) + scrollX;
+    const bot = Math.max(ra.bottom, rb.bottom) + scrollY;
+    $box.css({ left, top, width: right - left, height: bot - top });
   };
 
-  const copySel = () => {
+  function copySelection(format = "tsv") {
     if (!sel.size) return;
-    const rows = [...sel].reduce((m, k) => {
+    const rowsMap = [...sel].reduce((m, k) => {
       const [r, c] = k.split("|");
       (m[r] ??= []).push(+c);
       return m;
     }, {});
-    const sortedRowIndices = Object.keys(rows)
+    const rowIdxs = Object.keys(rowsMap)
       .map(Number)
       .sort((a, b) => a - b);
-    const tsv = sortedRowIndices
-      .filter((r) => {
-        if (!EXCLUDE_HEADER_ROWS_IN_COPY) return true;
-        const $row = getRows($scope).eq(r);
-        return !$row.closest("thead").length;
-      })
-      .map((r) =>
-        rows[r]
-          .sort((a, b) => a - b)
-          .map((c) => {
-            const $cel = getCell(r, c);
-            return $cel.text().trim();
-          })
-          .join("\t")
-      )
-      .join("\n");
-    GM_setClipboard(tsv);
-  };
 
-  const isAddMode = (e) => MODIFIER_KEY.primary(e) && MODIFIER_KEY.shift(e);
-
-  let isModifierHeld = false;
+    let out;
+    if (format === "markdown") {
+      out = rowIdxs
+        .map((r, i) => {
+          const line =
+            "| " +
+            rowsMap[r]
+              .sort((a, b) => a - b)
+              .map((c) => getCell($scope, r, c).text().trim())
+              .join(" | ") +
+            " |";
+          if (i === 0) {
+            return (
+              line + "\n| " + rowsMap[r].map(() => "---").join(" | ") + " |"
+            );
+          }
+          return line;
+        })
+        .join("\n");
+    } else {
+      out = rowIdxs
+        .map((r) =>
+          rowsMap[r]
+            .sort((a, b) => a - b)
+            .map((c) => getCell($scope, r, c).text().trim())
+            .join("\t")
+        )
+        .join("\n");
+    }
+    GM_setClipboard(out);
+    const rCnt = rowIdxs.length,
+      cCnt = Math.max(...Object.values(rowsMap).map((a) => a.length));
+    showToast(
+      format === "markdown"
+        ? `Copied ${rCnt}×${cCnt} as Markdown`
+        : `Copied ${rCnt}×${cCnt} cells`
+    );
+  }
 
   $(document)
-    .on("mousedown", CELL_SELECTOR, function (e) {
-      if (e.button !== 0 || !MODIFIER_KEY.primary(e)) return;
-      if (!isModifierHeld) $("body").addClass("smart__selecting");
-      $scope = $(this).closest("table");
-      startR = curR = rIdx($(this));
-      startC = curC = cIdx($(this));
-      if (!isAddMode(e)) sel.clear();
+    .on("mousedown", (e) => {
+      if (e.button !== 0 || !isPrimary(e)) return;
+      const $cell = $(e.target).closest(CELL_SEL);
+      if (!$cell.length) return;
+
+      $scope = $cell.closest("table, .container-list");
+      if (!$scope.length) $scope = $(document);
+      scopeRows = getRows($scope);
+      startR = curR = rowIdx($cell, scopeRows);
+      startC = curC = colIdx($cell);
+
+      if (!isExtending(e)) sel.clear();
       rectKeys().forEach((k) => sel.add(k));
+
+      dragging = true;
       paint();
       $box.show();
+      document.body.classList.add(CONFIG.css.bodyClass);
       updateBox();
-      dragging = true;
       e.preventDefault();
     })
-
-    .on("mousemove", function (e) {
+    .on("mousemove", (e) => {
       if (!dragging) return;
-      const $cell = $(e.target).closest(CELL_SELECTOR);
+      const $cell = $(e.target).closest(CELL_SEL);
       if (!$cell.length) return;
-      curR = rIdx($cell);
-      curC = cIdx($cell);
-      if (!isAddMode(e)) sel.clear();
+      curR = rowIdx($cell, scopeRows);
+      curC = colIdx($cell);
+      if (!isExtending(e)) sel.clear();
       rectKeys().forEach((k) => sel.add(k));
       paint();
       updateBox();
+      $cell[0].scrollIntoView({ block: "nearest", inline: "nearest" }); // edge scroll
     })
-
-    .on("mouseup", function (e) {
+    .on("mouseup", (e) => {
       if (!dragging) return;
       dragging = false;
-      $("body").removeClass("smart__selecting");
       $box.hide();
-
+      document.body.classList.remove(CONFIG.css.bodyClass);
       paint();
 
-      const isClickOnly = startR === curR && startC === curC;
-      const txt = $(e.target).closest(CELL_SELECTOR).text().trim();
-
-      if (isClickOnly && txt) {
+      const single = startR === curR && startC === curC;
+      const txt = $(e.target).closest(CELL_SEL).text().trim();
+      if (single && txt) {
         GM_setClipboard(txt);
+        showToast("Copied cell");
       } else {
-        copySel();
+        copySelection();
       }
     });
 
-  window.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" || e.code === "Escape") {
-      sel.clear();
-      paint();
-    }
-    if (MODIFIER_KEY.primary(e)) {
-      isModifierHeld = true;
-      document.body.classList.add("smart__selecting");
-    }
-  });
-
-  window.addEventListener("keyup", (e) => {
-    if (!MODIFIER_KEY.primary(e)) {
-      isModifierHeld = false;
-      if (!dragging) {
-        document.body.classList.remove("smart__selecting");
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      if (e.key === "Escape") {
+        if (kbMode) {
+          kbMode = false;
+          paint();
+          return;
+        }
+        sel.clear();
+        paint();
+        return;
       }
-    }
-  });
+
+      if (isPrimary(e) && e.key.toLowerCase() === CONFIG.keys.kbToggle) {
+        e.preventDefault();
+        kbMode = !kbMode;
+        if (kbMode) {
+          const $focused = $(document.activeElement).closest(CELL_SEL);
+          const $cell = $focused.length
+            ? $focused
+            : $(CELL_SEL).filter(":visible").first();
+          if (!$cell.length) {
+            kbMode = false;
+            return;
+          }
+          $scope = $cell.closest("table, .container-list");
+          scopeRows = getRows($scope);
+          startR = curR = rowIdx($cell, scopeRows);
+          startC = curC = colIdx($cell);
+          sel.clear();
+          sel.add(key(startR, startC));
+          paint();
+        } else {
+          sel.clear();
+          paint();
+        }
+        return;
+      }
+
+      if (isPrimary(e) && e.key.toLowerCase() === "m") {
+        e.preventDefault();
+        copySelection("markdown");
+        return;
+      }
+
+      if (kbMode) {
+        const AR = { ArrowUp: -1, ArrowDown: 1, ArrowLeft: -1, ArrowRight: 1 };
+        if (e.key in AR) {
+          e.preventDefault();
+          if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+            curR = Math.max(
+              0,
+              Math.min(scopeRows.length - 1, curR + AR[e.key])
+            );
+          } else {
+            curC = Math.max(0, curC + AR[e.key]);
+          }
+          sel.clear();
+          rectKeys().forEach((k) => sel.add(k));
+          paint();
+          getCell($scope, curR, curC)[0].scrollIntoView({ block: "nearest" });
+          return;
+        }
+        if (e.key === " " || e.key === "Enter") {
+          e.preventDefault();
+          kbMode = false;
+          copySelection();
+          paint();
+          return;
+        }
+      }
+
+      if (isPrimary(e) && !modifierHeld) {
+        modifierHeld = true;
+        document.body.classList.add(CONFIG.css.bodyClass);
+      }
+    },
+    true
+  );
+
+  window.addEventListener(
+    "keyup",
+    (e) => {
+      if (!isPrimary(e)) {
+        modifierHeld = false;
+        if (!dragging) document.body.classList.remove(CONFIG.css.bodyClass);
+      }
+    },
+    true
+  );
 })(window.jQuery.noConflict(true));
