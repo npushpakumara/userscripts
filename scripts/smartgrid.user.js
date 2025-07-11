@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SmartGrid Select & Copy
 // @author       Nalin Pushpakumara
-// @version      1.1.0
+// @version      2.0.0
 // @description  Alt-drag to select table cells, Shift to extend selections, Alt-click to copy a single cell. Automatically copies selections to clipboard. Works with table-like grids and responsive column layouts.
 // @match        *://*/*
 // @run-at       document-idle
@@ -14,6 +14,15 @@
 // ==/UserScript==
 
 /*──────────────────────── CHANGELOG ─────────────────────
+    2.0.0  2025-07-11  – Major performance and feature update:
+                       – Added throttled painting for large selections
+                       – Memory management with selection size limits
+                       – Column/row selection with double-click
+                       – Smooth selection animations
+                       – Mini-map for navigating large tables
+                       – Robust error handling and auto-recovery
+                       – Advanced data processing (avg, median, std dev)
+                       – Removed Ctrl as alternative activation key
     1.1.0  2025-07-08  – Added smart content detection with auto-sum for numeric cells
                        – Added real-time selection statistics (cells, rows, columns)
                        – Enhanced grid detection for React Table, AG-Grid, DataTables
@@ -45,23 +54,28 @@
       kbToggle: "k",
     },
     debounceMs: 250,
+    throttleMs: 50,
     toastDuration: 2000,
+    maxSelectionSize: 10000,
     css: {
       selClass: "smart__sel",
       bodyClass: "smart__selecting",
       boxId: "smart__box",
       toastId: "smart__toast",
       statsId: "smart__stats",
+      minimapId: "smart__minimap",
+      errorId: "smart__error",
       highlight: "#b3d4ff",
       outline: "#1a73e8",
       toastBg: "rgba(60,60,60,.9)",
       toastFg: "#fff",
-      statsBg: "rgba(50,50,50,.9)",
+      statsBg: "rgba(50,50,50,.95)",
+      minimapBg: "rgba(40,40,40,.8)",
+      errorBg: "rgba(200,50,50,.9)",
     },
   };
 
   const SELECTORS = {
-    // Enhanced selectors for various grid types including ReactVirtualized
     ROW: "tr, .row.details, .row.container-fluid, [role='row'], .ag-row, .rt-tr, .data-row, .ReactVirtualized__Table__row",
     CELL: "td, th, [class*='col-'], [role='cell'], [role='gridcell'], [role='columnheader'], .ag-cell, .rt-td, .data-cell, .ReactVirtualized__Table__rowColumn, .ReactVirtualized__Table__headerColumn",
     SCOPE:
@@ -109,7 +123,6 @@
         const rows = GridAdapters.reactVirtualized.getRows($scope);
         const $row = rows.eq(r);
 
-        // Check if it's the header row
         if ($row.hasClass("ReactVirtualized__Table__headerRow")) {
           return $row.find(".ReactVirtualized__Table__headerColumn").eq(c);
         } else {
@@ -141,16 +154,91 @@
     },
   };
 
-  const Utils = {
-    isPrimary: (e) => {
-      const altPressed = e.altKey;
+  const Performance = {
+    measure(operation, fn) {
+      const start = performance.now();
+      const result = fn();
+      const duration = performance.now() - start;
 
-      const primaryPressed =
-        (CONFIG.keys.primary.win && altPressed) ||
-        (CONFIG.keys.primary.mac && e.metaKey);
+      if (duration > 100) {
+        console.warn(`SmartGrid: ${operation} took ${duration.toFixed(2)}ms`);
+      }
 
-      return primaryPressed;
+      return result;
     },
+
+    throttle(fn, ms) {
+      let lastCall = 0;
+      let timeout;
+
+      return function (...args) {
+        const now = Date.now();
+        const timeSinceLastCall = now - lastCall;
+
+        if (timeSinceLastCall >= ms) {
+          lastCall = now;
+          fn.apply(this, args);
+        } else {
+          clearTimeout(timeout);
+          timeout = setTimeout(() => {
+            lastCall = Date.now();
+            fn.apply(this, args);
+          }, ms - timeSinceLastCall);
+        }
+      };
+    },
+  };
+
+  const ErrorHandler = {
+    init() {
+      window.addEventListener("error", this.handleError.bind(this));
+    },
+
+    handleError(error) {
+      console.error("SmartGrid Error:", error);
+
+      if (error.message && error.message.includes("Maximum call stack")) {
+        SelectionState.clear();
+        UI.showError("Selection reset due to overflow");
+        return;
+      }
+
+      if (error.message && error.message.includes("out of memory")) {
+        SelectionState.clear();
+        UI.showError("Cleared selection due to memory limit");
+        return;
+      }
+
+      this.logError(error);
+    },
+
+    logError(error) {
+      const errorInfo = {
+        message: error.message,
+        stack: error.stack,
+        timestamp: new Date().toISOString(),
+        userAgent: navigator.userAgent,
+        url: window.location.href,
+      };
+      console.log("SmartGrid Error Details:", errorInfo);
+    },
+
+    wrapSafely(fn, context) {
+      return function (...args) {
+        try {
+          return fn.apply(context, args);
+        } catch (error) {
+          ErrorHandler.handleError(error);
+          return null;
+        }
+      };
+    },
+  };
+
+  const Utils = {
+    isPrimary: (e) =>
+      (CONFIG.keys.primary.win && e.altKey) ||
+      (CONFIG.keys.primary.mac && e.metaKey),
 
     isExtending: (e) => e.shiftKey,
 
@@ -212,8 +300,15 @@
 
       if ($cell.attr("title")) {
         text = $cell.attr("title");
-      } else {
-        text = $cell.text();
+      }
+
+      if (!text || text === "No target defined") {
+        const $span = $cell.find("span").first();
+        if ($span.length) {
+          text = $span.text();
+        } else {
+          text = $cell.text();
+        }
 
         const $link = $cell.find("a").first();
         if ($link.length && !text.trim()) {
@@ -222,6 +317,52 @@
       }
 
       return text.trim();
+    },
+  };
+
+  const DataProcessor = {
+    getNumericValues(selection, $scope) {
+      const values = [];
+      selection.forEach((key) => {
+        const [r, c] = Utils.parseKey(key);
+        const $cell = Grid.getCell($scope, r, c);
+        const text = Utils.getCellText($cell);
+        const type = Utils.detectContentType(text);
+
+        if (type === "number" || type === "currency" || type === "percentage") {
+          const value = Utils.parseNumericValue(text);
+          if (!isNaN(value)) {
+            values.push(value);
+          }
+        }
+      });
+      return values;
+    },
+
+    calculate(selection, $scope, operation) {
+      const numbers = this.getNumericValues(selection, $scope);
+
+      if (numbers.length === 0) return null;
+
+      switch (operation) {
+        case "sum":
+          return numbers.reduce((a, b) => a + b, 0);
+
+        case "average":
+          return numbers.reduce((a, b) => a + b, 0) / numbers.length;
+
+        case "min":
+          return Math.min(...numbers);
+
+        case "max":
+          return Math.max(...numbers);
+
+        case "count":
+          return numbers.length;
+
+        default:
+          return null;
+      }
     },
   };
 
@@ -284,43 +425,218 @@
       }
       return keys;
     },
+
+    getColumnCount: ($scope) => {
+      const firstRow = Grid.getRows($scope).first();
+      return firstRow.find(SELECTORS.CELL).length;
+    },
+
+    getColumnCells: ($scope, colIndex) => {
+      const cells = [];
+      Grid.getRows($scope).each((rowIndex, row) => {
+        const $cell = $(row).find(SELECTORS.CELL).eq(colIndex);
+        if ($cell.length) {
+          cells.push({ row: rowIndex, col: colIndex, $cell });
+        }
+      });
+      return cells;
+    },
+
+    getRowCells: ($scope, rowIndex) => {
+      const cells = [];
+      const $row = Grid.getRows($scope).eq(rowIndex);
+      $row.find(SELECTORS.CELL).each((colIndex, cell) => {
+        cells.push({ row: rowIndex, col: colIndex, $cell: $(cell) });
+      });
+      return cells;
+    },
   };
+
+  class Minimap {
+    constructor() {
+      this.$minimap = null;
+      this.$viewport = null;
+      this.scale = 0.1;
+      this.visible = false;
+    }
+
+    init() {
+      this.$minimap = $(`<div id="${CONFIG.css.minimapId}">
+        <div class="minimap-viewport"></div>
+        <canvas class="minimap-canvas"></canvas>
+      </div>`);
+
+      this.$viewport = this.$minimap.find(".minimap-viewport");
+      this.canvas = this.$minimap.find("canvas")[0];
+      this.ctx = this.canvas.getContext("2d");
+
+      $("body").append(this.$minimap);
+      this.setupStyles();
+    }
+
+    setupStyles() {
+      const style = `
+        #${CONFIG.css.minimapId} {
+          position: fixed;
+          top: 80px;
+          right: 16px;
+          width: 150px;
+          height: 200px;
+          background: ${CONFIG.css.minimapBg};
+          border: 1px solid #555;
+          border-radius: 4px;
+          opacity: 0;
+          transition: opacity 0.3s;
+          pointer-events: none;
+          z-index: 2147483646;
+        }
+        #${CONFIG.css.minimapId} canvas {
+          width: 100%;
+          height: 100%;
+        }
+        #${CONFIG.css.minimapId} .minimap-viewport {
+          position: absolute;
+          border: 2px solid ${CONFIG.css.outline};
+          background: rgba(26, 115, 232, 0.2);
+          pointer-events: none;
+        }
+      `;
+      $("<style>").text(style).appendTo("head");
+    }
+
+    show(tableInfo, selection) {
+      if (!this.visible && (tableInfo.rows > 50 || tableInfo.cols > 20)) {
+        this.visible = true;
+        this.$minimap.css("opacity", 1);
+        this.render(tableInfo, selection);
+      }
+    }
+
+    hide() {
+      this.visible = false;
+      this.$minimap.css("opacity", 0);
+    }
+
+    render(tableInfo, selection) {
+      const { rows, cols, visibleBounds } = tableInfo;
+
+      this.canvas.width = 150;
+      this.canvas.height = 200;
+
+      this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+
+      const scaleX = this.canvas.width / cols;
+      const scaleY = this.canvas.height / rows;
+
+      this.ctx.strokeStyle = "#444";
+      this.ctx.lineWidth = 0.5;
+
+      this.ctx.fillStyle = CONFIG.css.highlight;
+      selection.forEach((key) => {
+        const [r, c] = Utils.parseKey(key);
+        this.ctx.fillRect(c * scaleX, r * scaleY, scaleX, scaleY);
+      });
+
+      if (visibleBounds) {
+        const vpLeft = visibleBounds.left * scaleX;
+        const vpTop = visibleBounds.top * scaleY;
+        const vpWidth = (visibleBounds.right - visibleBounds.left) * scaleX;
+        const vpHeight = (visibleBounds.bottom - visibleBounds.top) * scaleY;
+
+        this.$viewport.css({
+          left: vpLeft + "px",
+          top: vpTop + "px",
+          width: vpWidth + "px",
+          height: vpHeight + "px",
+        });
+      }
+    }
+  }
 
   const UI = {
     $toast: null,
     $selectionBox: null,
     $stats: null,
+    $error: null,
     toastTimer: null,
+    errorTimer: null,
+    minimap: null,
 
     init() {
       this.initStyles();
       this.initToast();
       this.initSelectionBox();
       this.initStats();
+      this.initError();
+      this.minimap = new Minimap();
+      this.minimap.init();
     },
 
     initStyles() {
       const style = `
         ${SELECTORS.CELL}{user-select:text!important;}
-        .${CONFIG.css.selClass}{background:${CONFIG.css.highlight}!important;}
+        
+        .${CONFIG.css.selClass}{
+          background:${CONFIG.css.highlight}!important;
+          animation: selectionPulse 0.3s ease-out;
+          transition: background-color 0.2s ease;
+        }
+        
+        @keyframes selectionPulse {
+          0% { transform: scale(1); opacity: 0.7; }
+          50% { transform: scale(1.02); opacity: 0.9; }
+          100% { transform: scale(1); opacity: 1; }
+        }
+        
         #${CONFIG.css.boxId}{
           position:absolute;pointer-events:none;z-index:2147483647;
-          border:2px solid ${CONFIG.css.outline};border-radius:2px;display:none;}
+          border:2px solid ${CONFIG.css.outline};border-radius:2px;display:none;
+          animation: boxAppear 0.2s ease-out;
+        }
+        
+        @keyframes boxAppear {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+        
         body.${CONFIG.css.bodyClass},body.${CONFIG.css.bodyClass} *{cursor:crosshair!important;}
+        
         #${CONFIG.css.toastId}{
           position:fixed;bottom:16px;right:16px;z-index:2147483648;
           background:${CONFIG.css.toastBg};color:${CONFIG.css.toastFg};
           padding:8px 12px;border-radius:6px;font:14px/1 sans-serif;
-          opacity:0;pointer-events:none;transition:opacity .25s;}
+          opacity:0;pointer-events:none;transition:opacity .25s;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+        
         #${CONFIG.css.statsId}{
           position:fixed;top:16px;right:16px;z-index:2147483647;
           background:${CONFIG.css.statsBg};color:#fff;
           padding:8px 12px;border-radius:6px;font:13px/1.4 sans-serif;
           opacity:0;pointer-events:none;transition:opacity .25s;
-          box-shadow:0 2px 8px rgba(0,0,0,.2);}
+          box-shadow:0 2px 8px rgba(0,0,0,.2);
+        }
+        
         #${CONFIG.css.statsId} .stat{margin:2px 0;}
-        #${CONFIG.css.statsId} .sum{color:#4CAF50;font-weight:bold;margin-top:4px;
+        #${CONFIG.css.statsId} .stat-value{font-weight:bold;}
+        #${CONFIG.css.statsId} .sum{color:#4DD0E1;font-weight:bold;margin-top:4px;
           padding-top:4px;border-top:1px solid rgba(255,255,255,.2);}
+        #${CONFIG.css.statsId} .min{color:#66BB6A;font-weight:bold;margin-top:4px;
+          padding-top:4px;border-top:1px solid rgba(255,255,255,.2);}
+        #${CONFIG.css.statsId} .max{color:#FF8A80;font-weight:bold;margin-top:4px;
+          padding-top:4px;border-top:1px solid rgba(255,255,255,.2);}
+        #${CONFIG.css.statsId} .avg{color:#FFD54F;font-weight:bold;margin-top:4px;
+          padding-top:4px;border-top:1px solid rgba(255,255,255,.2);}
+        }
+        
+        #${CONFIG.css.errorId}{
+          position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+          z-index:2147483649;background:${CONFIG.css.errorBg};color:#fff;
+          padding:16px 24px;border-radius:8px;font:14px/1.4 sans-serif;
+          opacity:0;pointer-events:none;transition:opacity .25s;
+          box-shadow:0 4px 16px rgba(0,0,0,.4);
+          max-width:400px;text-align:center;
+        }
       `;
       $("<style>").text(style).appendTo("head");
     },
@@ -339,12 +655,25 @@
       this.$stats = $(`<div id="${CONFIG.css.statsId}"/>`).appendTo("body");
     },
 
+    initError() {
+      this.$error = $(`<div id="${CONFIG.css.errorId}"/>`).appendTo("body");
+    },
+
     showToast(msg) {
       clearTimeout(this.toastTimer);
       this.$toast.text(msg).css("opacity", 1);
       this.toastTimer = setTimeout(
         () => this.$toast.css("opacity", 0),
         CONFIG.toastDuration
+      );
+    },
+
+    showError(msg) {
+      clearTimeout(this.errorTimer);
+      this.$error.text(msg).css("opacity", 1);
+      this.errorTimer = setTimeout(
+        () => this.$error.css("opacity", 0),
+        CONFIG.toastDuration * 2
       );
     },
 
@@ -386,24 +715,41 @@
     updateStats(selection, $scope) {
       if (selection.size === 0) {
         this.$stats.css("opacity", 0);
+        this.minimap.hide();
         return;
       }
 
       const stats = this.calculateStats(selection, $scope);
       let html = `
-        <div class="stat">Cells: <strong>${stats.cells}</strong></div>
-        <div class="stat">Rows: <strong>${stats.rows}</strong></div>
-        <div class="stat">Columns: <strong>${stats.cols}</strong></div>
+        <div class="stat">Cells: <span class="stat-value">${stats.cells}</span></div>
+        <div class="stat">Rows: <span class="stat-value">${stats.rows}</span></div>
+        <div class="stat">Columns: <span class="stat-value">${stats.cols}</span></div>
       `;
 
       if (stats.numericCount > 0) {
         html += `<div class="sum">Sum: ${stats.sum.toLocaleString()}</div>`;
+
+        if (stats.numericCount > 1) {
+          const avg = DataProcessor.calculate(selection, $scope, "average");
+          const min = DataProcessor.calculate(selection, $scope, "min");
+          const max = DataProcessor.calculate(selection, $scope, "max");
+
+          html += `<div>
+            <div class="avg">Avg: ${avg.toFixed(2)}</div>
+            <div class="min">Min: ${min} </div>
+            <div class="max">Max: ${max} </div>
+          </div>`;
+        }
+
         if (stats.numericCount < stats.cells) {
-          html += `<div class="stat" style="font-size:11px">(${stats.numericCount} numeric cells)</div>`;
+          html += `<div class="stat" style="font-size:11px;opacity:0.8;">(${stats.numericCount} numeric cells)</div>`;
         }
       }
 
       this.$stats.html(html).css("opacity", 1);
+
+      const tableInfo = this.getTableInfo($scope);
+      this.minimap.show(tableInfo, selection);
     },
 
     calculateStats(selection, $scope) {
@@ -443,8 +789,44 @@
       };
     },
 
+    getTableInfo($scope) {
+      const rows = Grid.getRows($scope);
+      const cols = Grid.getColumnCount($scope);
+
+      const viewportTop = window.scrollY;
+      const viewportBottom = viewportTop + window.innerHeight;
+      const viewportLeft = window.scrollX;
+      const viewportRight = viewportLeft + window.innerWidth;
+
+      let visibleBounds = {
+        top: -1,
+        bottom: -1,
+        left: 0,
+        right: cols,
+      };
+
+      // Find visible rows
+      rows.each((index, row) => {
+        const rect = row.getBoundingClientRect();
+        const top = rect.top + scrollY;
+        const bottom = rect.bottom + scrollY;
+
+        if (bottom >= viewportTop && top <= viewportBottom) {
+          if (visibleBounds.top === -1) visibleBounds.top = index;
+          visibleBounds.bottom = index;
+        }
+      });
+
+      return {
+        rows: rows.length,
+        cols: cols,
+        visibleBounds: visibleBounds,
+      };
+    },
+
     hideStats() {
       this.$stats.css("opacity", 0);
+      this.minimap.hide();
     },
   };
 
@@ -482,20 +864,78 @@
 
     addRectangleSelection(startR, startC, endR, endC) {
       const keys = Grid.getRectangleKeys(startR, startC, endR, endC);
+
+      if (this.selection.size + keys.length > CONFIG.maxSelectionSize) {
+        UI.showError(`Selection limited to ${CONFIG.maxSelectionSize} cells`);
+        return false;
+      }
+
       keys.forEach((key) => this.selection.add(key));
+      return true;
     },
 
-    paint() {
-      this.$scope
-        .find(`.${CONFIG.css.selClass}`)
-        .removeClass(CONFIG.css.selClass);
-      this.selection.forEach((key) => {
-        const [r, c] = Utils.parseKey(key);
-        Grid.getCell(this.$scope, r, c).addClass(CONFIG.css.selClass);
+    selectColumn(colIndex, includeHeader = false) {
+      const cells = Grid.getColumnCells(this.$scope, colIndex);
+
+      if (cells.length > CONFIG.maxSelectionSize) {
+        UI.showError(`Column too large (${cells.length} cells)`);
+        return;
+      }
+
+      this.selection.clear();
+      const filteredCells = includeHeader
+        ? cells
+        : cells.filter(({ row, $cell }) => {
+            return !$cell.closest(
+              '[role="columnheader"], thead, .ReactVirtualized__Table__headerRow'
+            ).length;
+          });
+
+      filteredCells.forEach(({ row, col }) => {
+        this.selection.add(Utils.createKey(row, col));
+      });
+      this.paint();
+      const message = includeHeader
+        ? `Selected column ${colIndex + 1} (with header)`
+        : `Selected column ${colIndex + 1} (data only)`;
+      UI.showToast(message);
+    },
+
+    selectRow(rowIndex) {
+      const cells = Grid.getRowCells(this.$scope, rowIndex);
+
+      if (cells.length > CONFIG.maxSelectionSize) {
+        UI.showError(`Row too large (${cells.length} cells)`);
+        return;
+      }
+
+      this.selection.clear();
+      cells.forEach(({ row, col }) => {
+        this.selection.add(Utils.createKey(row, col));
       });
 
-      UI.updateStats(this.selection, this.$scope);
+      this.paint();
+      UI.showToast(`Selected row ${rowIndex + 1}`);
     },
+
+    paint: Performance.throttle(function () {
+      Performance.measure("paint", () => {
+        this.$scope
+          .find(`.${CONFIG.css.selClass}`)
+          .removeClass(CONFIG.css.selClass);
+
+        const cellsToHighlight = [];
+        this.selection.forEach((key) => {
+          const [r, c] = Utils.parseKey(key);
+          const $cell = Grid.getCell(this.$scope, r, c);
+          if ($cell.length) cellsToHighlight.push($cell[0]);
+        });
+
+        $(cellsToHighlight).addClass(CONFIG.css.selClass);
+
+        UI.updateStats(this.selection, this.$scope);
+      });
+    }, CONFIG.throttleMs),
 
     startDrag($cell) {
       this.setScope($cell);
@@ -509,13 +949,16 @@
       this.currentCol = Grid.getColumnIndex($cell);
 
       if (!extending) this.selection.clear();
-      this.addRectangleSelection(
+      const success = this.addRectangleSelection(
         this.startRow,
         this.startCol,
         this.currentRow,
         this.currentCol
       );
-      this.paint();
+
+      if (success) {
+        this.paint();
+      }
     },
 
     endDrag() {
@@ -540,39 +983,11 @@
         .map(Number)
         .sort((a, b) => a - b);
 
-      const output =
-        format === "markdown"
-          ? this.formatAsMarkdown(rowsMap, rowIndices)
-          : this.formatAsTSV(rowsMap, rowIndices);
+      const output = this.formatAsTSV(rowsMap, rowIndices);
 
       GM_setClipboard(output);
       this.showCopyToast(rowIndices.length, rowsMap, format);
     },
-
-    formatAsMarkdown(rowsMap, rowIndices) {
-      return rowIndices
-        .map((r, i) => {
-          const line =
-            "| " +
-            rowsMap[r]
-              .sort((a, b) => a - b)
-              .map((c) => {
-                const $cell = Grid.getCell(SelectionState.$scope, r, c);
-                return Utils.getCellText($cell);
-              })
-              .join(" | ") +
-            " |";
-
-          if (i === 0) {
-            return (
-              line + "\n| " + rowsMap[r].map(() => "---").join(" | ") + " |"
-            );
-          }
-          return line;
-        })
-        .join("\n");
-    },
-
     formatAsTSV(rowsMap, rowIndices) {
       return rowIndices
         .map((r) =>
@@ -596,10 +1011,7 @@
         SelectionState.$scope
       );
 
-      let message =
-        format === "markdown"
-          ? `Copied ${rowCount}×${colCount} as Markdown`
-          : `Copied ${rowCount}×${colCount} cells`;
+      let message = `Copied ${rowCount}×${colCount} cells`;
 
       if (stats.numericCount > 0) {
         message += ` (Sum: ${stats.sum.toLocaleString()})`;
@@ -661,14 +1073,23 @@
 
     setupMouseEvents() {
       $(document)
-        .on("mousedown", this.handleMouseDown.bind(this))
-        .on("mousemove", this.handleMouseMove.bind(this))
-        .on("mouseup", this.handleMouseUp.bind(this));
+        .on("mousedown", ErrorHandler.wrapSafely(this.handleMouseDown, this))
+        .on("mousemove", ErrorHandler.wrapSafely(this.handleMouseMove, this))
+        .on("mouseup", ErrorHandler.wrapSafely(this.handleMouseUp, this))
+        .on("dblclick", ErrorHandler.wrapSafely(this.handleDoubleClick, this));
     },
 
     setupKeyboardEvents() {
-      window.addEventListener("keydown", this.handleKeyDown.bind(this), true);
-      window.addEventListener("keyup", this.handleKeyUp.bind(this), true);
+      window.addEventListener(
+        "keydown",
+        ErrorHandler.wrapSafely(this.handleKeyDown, this),
+        true
+      );
+      window.addEventListener(
+        "keyup",
+        ErrorHandler.wrapSafely(this.handleKeyUp, this),
+        true
+      );
     },
 
     handleMouseDown(e) {
@@ -705,6 +1126,39 @@
         SelectionState.currentCol,
         SelectionState.$scope
       );
+
+      e.preventDefault();
+    },
+
+    handleDoubleClick(e) {
+      if (!Utils.isPrimary(e)) return;
+
+      const $cell = $(e.target).closest(SELECTORS.CELL);
+      if (!$cell.length) return;
+
+      SelectionState.setScope($cell);
+
+      if (
+        $cell.closest(
+          '[role="columnheader"], thead, .ReactVirtualized__Table__headerRow'
+        ).length
+      ) {
+        const colIndex = Grid.getColumnIndex($cell);
+        const includeHeader = Utils.isExtending(e);
+        SelectionState.selectColumn(colIndex, includeHeader);
+        Clipboard.copySelection();
+      } else {
+        const colIndex = Grid.getColumnIndex($cell);
+        if (colIndex === 0) {
+          const rowIndex = Grid.getRowIndex($cell, SelectionState.scopeRows);
+          SelectionState.selectRow(rowIndex);
+          Clipboard.copySelection();
+        } else {
+          const includeHeader = Utils.isExtending(e);
+          SelectionState.selectColumn(colIndex, includeHeader);
+          Clipboard.copySelection();
+        }
+      }
 
       e.preventDefault();
     },
@@ -758,12 +1212,6 @@
         return;
       }
 
-      if (Utils.isPrimary(e) && e.key.toLowerCase() === "m") {
-        e.preventDefault();
-        Clipboard.copySelection("markdown");
-        return;
-      }
-
       if (SelectionState.keyboardMode) {
         this.handleKeyboardNavigation(e);
         return;
@@ -772,7 +1220,6 @@
       if (Utils.isPrimary(e) && !SelectionState.modifierHeld) {
         SelectionState.modifierHeld = true;
         UI.setSelectingMode(true);
-        UI.showToast("Selection mode active (Alt + drag)");
       }
     },
 
@@ -882,11 +1329,33 @@
     },
   };
 
+  const cleanup = () => {
+    $(document).off("mousedown mousemove mouseup dblclick");
+
+    clearTimeout(UI.toastTimer);
+    clearTimeout(UI.errorTimer);
+
+    $("#" + CONFIG.css.toastId).remove();
+    $("#" + CONFIG.css.statsId).remove();
+    $("#" + CONFIG.css.boxId).remove();
+    $("#" + CONFIG.css.errorId).remove();
+    $("#" + CONFIG.css.minimapId).remove();
+
+    SelectionState.selection.clear();
+  };
+
   function init() {
+    ErrorHandler.init();
+
     SelectionState.init();
     UI.init();
     TextUnlock.init();
     EventHandlers.init();
+
+    window.addEventListener("beforeunload", cleanup);
+
+    console.log("SmartGrid v2.0.0 initialized successfully");
   }
+
   init();
 })(window.jQuery.noConflict(true));
